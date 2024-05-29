@@ -1,0 +1,293 @@
+from kucoin.client import Client
+from kucoin_futures.client import Market as FuturesMarket
+from datetime import datetime, timedelta
+import pandas as pd
+from sklearn.preprocessing import MinMaxScaler, LabelEncoder
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import GRU, Dense, Dropout, Input, Embedding
+from tensorflow.keras.utils import to_categorical
+from sklearn.model_selection import train_test_split
+import numpy as np
+import matplotlib.pyplot as plt
+import time
+from colorama import Fore, Style
+import pytz
+import uuid
+import requests
+import json
+import hashlib
+import base64
+import hmac
+from sklearn.metrics import confusion_matrix
+import numpy as np
+import pandas as pd
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import mean_squared_error
+from scipy.stats import t as t_dist
+import matplotlib.pyplot as plt
+from scipy import stats
+
+# Replace with your KuCoin API key, secret, and passphrase
+api_key = ''
+api_secret = ''
+api_passphrase = 'George25$'
+
+# Initialize the futures market client correctly after API credentials
+futures_client = FuturesMarket(api_key, api_secret, api_passphrase)
+
+# Correct initialization of the Client for spot market (if needed)
+client = Client(api_key, api_secret, api_passphrase)
+
+# API URL
+api_url = 'https://api.kucoin.com'
+
+client = Client(api_key, api_secret, api_passphrase)
+
+
+# Helper functions to create a signature, get headers, etc.
+def create_signature(api_secret, timestamp, method, endpoint, body=''):
+    str_to_sign = str(timestamp) + method + endpoint + body
+    signature = base64.b64encode(hmac.new(api_secret.encode('utf-8'), str_to_sign.encode('utf-8'), hashlib.sha256).digest())
+    return signature.decode('utf-8')
+
+def get_timestamp():
+    return int(time.time() * 1000)
+
+def get_headers(api_key, api_secret, api_passphrase, method, endpoint, body=''):
+    timestamp = get_timestamp()
+    signature = create_signature(api_secret, timestamp, method, endpoint, body)
+    passphrase = base64.b64encode(hmac.new(api_secret.encode('utf-8'), api_passphrase.encode('utf-8'), hashlib.sha256).digest()).decode('utf-8')
+    headers = {
+        'KC-API-KEY': api_key,
+        'KC-API-SIGN': signature,
+        'KC-API-TIMESTAMP': str(timestamp),
+        'KC-API-PASSPHRASE': passphrase,
+        'KC-API-KEY-VERSION': '2',
+        'Content-Type': 'application/json'
+    }
+    return headers
+
+
+
+# Improved function to fetch data with additional print statements for debugging
+def fetch_kucoin_data(symbol, start_timestamp, end_timestamp, interval):
+    print(f"Attempting to fetch data for {symbol} from {start_timestamp} to {end_timestamp} with interval {interval}")
+    endpoint = '/api/v1/market/candles'
+    full_url = f'{api_url}{endpoint}'
+    print(f"Full request URL: {full_url}")  # Log the full URL for verification
+    headers = get_headers(api_key, api_secret, api_passphrase, 'GET', endpoint)
+    params = {
+        'symbol': symbol,
+        'type': interval,
+        'startAt': start_timestamp,
+        'endAt': end_timestamp
+    }
+    response = requests.get(full_url, headers=headers, params=params)
+
+    if response.status_code == 200:
+        response_json = response.json()
+        if 'data' in response_json:
+            print(f"Successfully fetched data for {symbol}")
+            df = pd.DataFrame(response_json['data'], columns=['time', 'open', 'close', 'high', 'low', 'volume', 'turnover'])
+            # Ensure data types are correct
+            df[['open', 'high', 'low', 'close', 'volume']] = df[['open', 'high', 'low', 'close', 'volume']].apply(pd.to_numeric, errors='coerce')
+            print("First few rows of OHLC data:")
+            print(df[['time', 'open', 'high', 'low', 'close']].head())
+            print("Last few rows of OHLC data:")
+            print(df[['time', 'open', 'high', 'low', 'close']].tail())
+            return df
+        else:
+            print("The 'data' key is missing in the API response. Here is the response received:")
+            print(response_json)
+            return pd.DataFrame()
+    else:
+        print(f"Error fetching data: {response.status_code} {response.text}")
+        return pd.DataFrame()
+
+lookback = 200  # Lookback period for the rolling window
+retrain_interval = 24 * 3600  # Retrain every 24 hours (in seconds)
+training_window = 10000  # 1.5 months window for training
+current_position = 0  # 0: neutral, 1: long, -1: short
+
+
+# Correct usage of interval as per API documentation
+interval = '1hour'  # Corrected interval as per API documentation for candlestick pattern type
+
+# Use the corrected function to fetch data
+symbol = 'RNDR-USDT'
+# Example timestamps for demonstration (these should be replaced with actual Unix timestamps)
+start_timestamp = int((datetime.now() - timedelta(days=1600)).timestamp())
+end_timestamp = int(datetime.now().timestamp())
+
+df = fetch_kucoin_data(symbol, start_timestamp, end_timestamp, interval)
+if not df.empty:
+    print("Data fetched successfully:")
+    print(df.head())  # Print the first few rows to verify
+else:
+    print("Failed to fetch data.")
+
+def get_data(symbol, start_timestamp, end_timestamp, interval):
+    try:
+        # Assuming this is meant to fetch spot market data, not futures.
+        params = {
+            'symbol': symbol,
+            'type': interval,  # Ensure this parameter name matches the API documentation.
+            'startAt': start_timestamp,
+            'endAt': end_timestamp
+        }
+        response = requests.get(f'{api_url}/api/v1/market/candles', headers=get_headers(api_key, api_secret, api_passphrase, 'GET', '/api/v1/market/candles'), params=params)
+
+        if response.status_code == 200:
+            data = response.json()['data']
+            df = pd.DataFrame(data, columns=['time', 'open', 'close', 'high', 'low', 'volume', 'turnover'])
+            df['time'] = pd.to_datetime(df['time'], unit='s')
+            print(f"Fetched data for {symbol} from KuCoin")
+            return df
+        else:
+            print(f"Failed to fetch data: {response.text}")
+            return pd.DataFrame()
+    except Exception as e:
+        print(Fore.RED + f"Failed to fetch data from KuCoin for symbol {symbol}: {e}" + Style.RESET_ALL)
+        return pd.DataFrame()
+
+def preprocess_data(data):
+    if not data.empty and 'close' in data.columns:
+        try:
+            scaler = MinMaxScaler(feature_range=(0, 1))
+            scaled_data = scaler.fit_transform(data[['close']])
+            return scaled_data, scaler
+        except Exception as e:
+            print(f"Error during data preprocessing: {e}")
+            return None, None
+    else:
+        print("Data is empty or missing 'Close' column")
+        return None, None
+
+def create_dataset(data, lookback):
+    # print("[create_datatset] data: ", data.shape, data)
+    # print("[create_datatset] lookback: ", lookback)
+    features, targets = [], []
+    lookback = int(lookback)
+    for i in range(lookback, len(data)):
+        # print("[create_datatset] in loop")
+        features.append(data[i-lookback:i, 0])
+        targets.append(data[i, 0])
+    return np.array(features), np.array(targets)
+
+
+def create_gru_model(input_shape):
+    model = Sequential()
+    model.add(GRU(units=50, return_sequences=True, input_shape=input_shape))
+    model.add(GRU(units=50))
+    model.add(Dense(units=25))
+    model.add(Dense(units=1))
+    model.compile(optimizer='adam', loss='mean_squared_error')
+    return model
+
+
+
+current_position = 0  # 0: neutral, 1: long, -1: short
+trade_durations = []  # To store the duration of each trade
+trade_results = []  # To store the result of each trade
+winning_trades = 0  # To count the number of winning trades
+daily_predictions = []
+
+#Trend Labelling Technique
+
+def tValLinR(prices):
+    """
+    Calculate the t-value of a linear regression's slope coefficient.
+
+    Parameters:
+    - prices: A numpy array of prices.
+
+    Returns:
+    - t-value of the slope coefficient of the linear regression.
+    """
+    n = len(prices)
+    if n <= 1:
+        return 0
+    x = np.arange(n)
+    slope, intercept, r_value, p_value, std_err = stats.linregress(x, prices)
+    mean_x = np.mean(x)
+    se = std_err / np.sqrt(n) / mean_x
+    t_val = slope / se
+    return t_val
+
+def getBinsFromTrend(close_prices, span):
+    out = pd.DataFrame(index=close_prices.index, columns=['t1', 'tVal', 'bin'])
+    for i in range(len(close_prices)):
+        # Specify dtype='float64' to avoid FutureWarning
+        df0 = pd.Series(dtype='float64')
+        if i + max(span) > len(close_prices):
+            continue
+        for L in span:
+            if i + L > len(close_prices):
+                continue
+            df1 = close_prices[i:i+L]
+            df0.at[df1.index[-1]] = tValLinR(df1.values)
+        if not df0.empty:
+            dt1 = df0.replace([np.inf, -np.inf, np.nan], 0).abs().idxmax()
+            out.at[close_prices.index[i], 't1'] = dt1
+            out.at[close_prices.index[i], 'tVal'] = df0[dt1]
+            out.at[close_prices.index[i], 'bin'] = np.sign(df0[dt1])
+    out['t1'] = pd.to_datetime(out['t1'])
+    out['bin'] = pd.to_numeric(out['bin'], downcast='signed')
+    return out.dropna(subset=['bin'])
+
+# Trend-Scanning Labeling
+def trend_scanning_labels(close_prices, window_range, t_value_threshold=20):
+    trend_labels = [0] * len(close_prices)
+    t_values = [0] * len(close_prices)
+    p_values = [1] * len(close_prices)  # Initialize with ones (indicating no significance by default)
+
+    epsilon = 1e-10  # Small number to avoid division by zero
+
+    for i in range(len(close_prices)):
+        max_t_value = 0
+        best_trend = 0
+        best_p_value = 1
+
+        for L in window_range:
+            if i + L > len(close_prices) or L <= 2:  # Skip if window is too large or too small
+                continue
+
+            X = np.arange(L).reshape(-1, 1)
+            y = close_prices[i:i + L].values.reshape(-1, 1)
+            model = LinearRegression().fit(X, y)
+
+            mse = mean_squared_error(y, model.predict(X))
+            se = np.sqrt(mse / (L - 2))
+            se_beta1 = se / (np.sqrt(np.sum((X - np.mean(X)) ** 2)) + epsilon)
+            t_value = model.coef_[0] / se_beta1
+            dof = L - 1
+            p_value = 2 * (1 - t_dist.cdf(abs(t_value), dof))
+
+            if abs(t_value) > abs(max_t_value):
+                max_t_value = t_value
+                best_trend = np.sign(t_value) * (abs(t_value) >= t_value_threshold)  # Adjust for threshold
+                best_p_value = p_value
+
+        trend_labels[i] = best_trend
+        t_values[i] = max_t_value  # Keep the max_t_value regardless of p-value
+        p_values[i] = best_p_value
+
+    return trend_labels, t_values, p_values
+
+# Apply trend scanning
+window_range = list(range(3, 1000))  # Adjusted range to start from 3 for meaningful calculations
+trend_labels, t_values, p_values = trend_scanning_labels(df['close'], window_range)
+df['trend_labels'] = trend_labels
+df['t_values'] = t_values
+df['p_values'] = p_values
+print(df)
+
+
+# Filter to include only significant indices
+significant_mask = df['p_values'] < 0.05
+significant_dates = df['time'][significant_mask]
+significant_prices = df['close'][significant_mask]
+significant_labels = df['trend_labels'][significant_mask]
+
+
+
