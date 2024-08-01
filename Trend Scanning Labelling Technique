@@ -30,7 +30,7 @@ from scipy import stats
 # Replace with your KuCoin API key, secret, and passphrase
 api_key = ''
 api_secret = ''
-api_passphrase = 'George25$'
+api_passphrase = ''
 
 # Initialize the futures market client correctly after API credentials
 futures_client = FuturesMarket(api_key, api_secret, api_passphrase)
